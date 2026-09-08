@@ -85,6 +85,14 @@
                   # Basic auth, so the server can be driven over WebDAV without going
                   # through an OIDC flow.
                   PROXY_ENABLE_BASIC_AUTH = "true";
+                  # plain HTTP on 9200 -- the driver and the fleet both run
+                  # the proxy without TLS
+                  PROXY_TLS = "false";
+                  # the built-in IDP fatals on an http:// issuer (lico
+                  # bootstrap hard-requires https) and takes the whole
+                  # process down; nothing here uses OIDC -- basic auth only
+                  OC_EXCLUDE_RUN_SERVICES = "idp";
+                  IDM_ADMIN_PASSWORD = "admin";
 
                   # THE PROFILING. Per service, and there is no global form: the
                   # Pprof field carries only its own name, unlike LogLevel which
@@ -104,6 +112,24 @@
                 Restart = nixpkgs.lib.mkForce "no";
               };
 
+              # The workload: upload `files` files into one folder, wait until
+              # search has indexed them, DELETE the folder (which is what runs
+              # the descendant lookup in the search service), record the
+              # opencloud cgroup's memory and heap profiles to /repro-out, then
+              # power off. Identical in both VMs.
+              systemd.services.repro = {
+                wantedBy = [ "multi-user.target" ];
+                after = [ "opencloud.service" ];
+                requires = [ "opencloud.service" ];
+                path = [ pkgs.curl pkgs.gnugrep pkgs.findutils ];
+                serviceConfig = {
+                  Type = "oneshot";
+                  TimeoutStartSec = "infinity";
+                };
+                script = builtins.replaceStrings [ "@files@" ] [ (toString files) ]
+                  (builtins.readFile ./repro.sh);
+              };
+
               services.getty.autologinUser = "root";
               users.users.root.password = "";
             }
@@ -111,8 +137,12 @@
         };
 
       vms = {
-        vm-unpatched = mkVM { name = "unpatched"; };
-        vm-patched = mkVM { name = "patched"; patches = candidatePatches; };
+        # 5000, not the default 20000: at 20k the event pipeline never caught
+        # up in 30 minutes and the index stayed empty; 5k indexes reliably and
+        # the unpatched spike is still unmistakable.
+        vm-unpatched = mkVM { name = "unpatched"; files = 12000; };
+        vm-diag = mkVM { name = "unpatched"; files = 200; };
+        vm-patched = mkVM { name = "patched"; patches = candidatePatches; files = 12000; };
       };
 
       runnerApp = vm: {
