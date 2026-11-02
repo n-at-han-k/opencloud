@@ -91,6 +91,7 @@ CORE_SUITES=(
     "coreApiWebdavEtagPropagation2"
     "coreApiWebdavMove"
     "coreApiWebdavOperations"
+    "coreApiWebdavHls"
     "coreApiWebdavPreviews"
     "coreApiWebdavProperties"
     "coreApiWebdavUpload"

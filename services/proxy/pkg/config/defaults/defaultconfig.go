@@ -239,6 +239,24 @@ func DefaultPolicies() []config.Policy {
 					Endpoint: "/webdav/?preview=1",
 					Service:  "eu.opencloud.web.webdav",
 				},
+				// One route per DAV prefix covers every HLS artifact: the value
+				// is left empty, so the route matches on the hls parameter being
+				// present. Segment names cannot be enumerated here.
+				{
+					Type:     config.QueryRoute,
+					Endpoint: "/dav/?hls=",
+					Service:  "eu.opencloud.web.webdav",
+				},
+				{
+					Type:     config.QueryRoute,
+					Endpoint: "/remote.php/?hls=",
+					Service:  "eu.opencloud.web.webdav",
+				},
+				{
+					Type:     config.QueryRoute,
+					Endpoint: "/webdav/?hls=",
+					Service:  "eu.opencloud.web.webdav",
+				},
 				{
 					Endpoint: "/remote.php/",
 					Service:  "eu.opencloud.web.frontend",

@@ -27,6 +27,7 @@ type Config struct {
 	DisablePreviews    bool   `yaml:"disablePreviews" env:"OC_DISABLE_PREVIEWS;WEBDAV_DISABLE_PREVIEWS" desc:"Set this option to 'true' to disable rendering of thumbnails triggered via webdav access. Note that when disabled, all access to preview related webdav paths will return a 404." introductionVersion:"1.0.0"`
 
 	Thumbnails Thumbnails `yaml:"thumbnails"`
+	HLS        HLS        `yaml:"hls"`
 
 	Context context.Context `yaml:"-"`
 }
@@ -56,4 +57,36 @@ type Thumbnails struct {
 	AdditionalOutputTypes      []string `yaml:"additional_output_types" env:"OC_THUMBNAILS_ADDITIONAL_OUTPUT_TYPES;WEBDAV_THUMBNAILS_ADDITIONAL_OUTPUT_TYPES" desc:"Additional types a thumbnail is returned in, one per type of the image it is made from, as source:target entries, e.g. image/vnd.microsoft.icon:image/png. The built-in list is included; an entry for a source type that is already listed replaces it. The target is asked for by the name WEBDAV_THUMBNAILS_ADDITIONAL_GENERATOR_FORMATS gives it. A type that is not listed becomes a JPEG; a target this service has no format name for is asked for as a JPEG as well." introductionVersion:"%%NEXT%%"`
 
 	FontMapFile string `yaml:"txt_fontmap_file" env:"THUMBNAILS_TXT_FONTMAP_FILE;WEBDAV_THUMBNAILS_TXT_FONTMAP_FILE" desc:"The path to a font map file for txt thumbnails." introductionVersion:"%%NEXT%%"`
+}
+
+// HLS is how this service streams video and where it keeps the segments.
+//
+// It is a separate block from Thumbnails on purpose. The two share a pipeline
+// shape but nothing about their workload: a film's segments are gigabytes where
+// a thumbnail is kilobytes, so the caches want separate backends and separate
+// volumes, and ffmpeg's CPU limit has nothing to say about the image generator's
+// HTTP timeout.
+type HLS struct {
+	Disable bool `yaml:"disable" env:"OC_DISABLE_HLS;WEBDAV_DISABLE_HLS" desc:"Set this option to 'true' to disable HLS video streaming via webdav access. When disabled, all access to HLS related webdav paths will return a 404. This is separate from WEBDAV_DISABLE_PREVIEWS: turning previews off leaves playback working." introductionVersion:"%%NEXT%%"`
+
+	FfmpegBinary  string `yaml:"ffmpeg_binary" env:"WEBDAV_HLS_FFMPEG_BINARY" desc:"Path to the ffmpeg binary. Default: ffmpeg, looked up on PATH." introductionVersion:"%%NEXT%%"`
+	FfprobeBinary string `yaml:"ffprobe_binary" env:"WEBDAV_HLS_FFPROBE_BINARY" desc:"Path to the ffprobe binary. Default: ffprobe, looked up on PATH." introductionVersion:"%%NEXT%%"`
+
+	Concurrency   int `yaml:"concurrency" env:"WEBDAV_HLS_CONCURRENCY" desc:"How many ffmpeg runs may happen at once. A request that cannot get a slot is answered with 429 and a Retry-After. This is the limit that keeps transcoding from starving the rest of webdav, so it wants to be well below the core count." introductionVersion:"%%NEXT%%"`
+	ThreadsPerJob int `yaml:"threads_per_job" env:"WEBDAV_HLS_THREADS_PER_JOB" desc:"How many threads one ffmpeg run may use. Together with WEBDAV_HLS_CONCURRENCY this bounds total CPU: a run left unbounded takes every core and makes the concurrency limit meaningless." introductionVersion:"%%NEXT%%"`
+
+	SegmentDuration  string `yaml:"segment_duration" env:"WEBDAV_HLS_SEGMENT_DURATION" desc:"Target length of one HLS segment, e.g. 4s. Shorter segments seek more precisely and cost more overhead. Changing it retires every cached segment." introductionVersion:"%%NEXT%%"`
+	MaxInputFileSize string `yaml:"max_input_file_size" env:"WEBDAV_HLS_MAX_INPUT_FILE_SIZE" desc:"Maximum size of a source file HLS playback is offered for. A larger file is refused. Usable common abbreviations: [KB, KiB, MB, MiB, GB, GiB], example: 20GB" introductionVersion:"%%NEXT%%"`
+	Timeout          string `yaml:"timeout" env:"WEBDAV_HLS_TIMEOUT" desc:"Timeout for one HLS request: a probe, a keyframe index or a single segment run, e.g. 10m. It is not a bound on transcoding a whole film, because no single request ever does that. The keyframe index reads the whole source once, so this wants to be generous." introductionVersion:"%%NEXT%%"`
+
+	AdditionalSourceTypes []string `yaml:"additional_source_types" env:"OC_HLS_ADDITIONAL_SOURCE_TYPES;WEBDAV_HLS_ADDITIONAL_SOURCE_TYPES" desc:"Additional mime types HLS playback is attempted for. The built-in list is included; this only adds to them. A type ffprobe cannot read answers 404." introductionVersion:"%%NEXT%%"`
+
+	CacheBackend string `yaml:"cache_backend" env:"WEBDAV_HLS_CACHE_BACKEND" desc:"Cache backend for HLS artifacts: 'none', 'memory', 'file', or 's3'. Default: file. 'memory' is for tests only: one film fills it." introductionVersion:"%%NEXT%%"`
+	CacheDir     string `yaml:"cache_dir" env:"WEBDAV_HLS_CACHE_DIR" desc:"Directory for the file-based HLS cache (Default: $OC_BASE_DATA_PATH/hls/cache). Only used when WEBDAV_HLS_CACHE_BACKEND is 'file'. Deliberately not the thumbnail cache directory: the two have very different sizes and want separate eviction." introductionVersion:"%%NEXT%%"`
+
+	CacheS3Bucket    string `yaml:"cache_s3_bucket" env:"WEBDAV_HLS_CACHE_S3_BUCKET" desc:"S3 bucket name for the HLS cache." introductionVersion:"%%NEXT%%"`
+	CacheS3Region    string `yaml:"cache_s3_region" env:"WEBDAV_HLS_CACHE_S3_REGION" desc:"S3 region for the HLS cache." introductionVersion:"%%NEXT%%"`
+	CacheS3Endpoint  string `yaml:"cache_s3_endpoint" env:"WEBDAV_HLS_CACHE_S3_ENDPOINT" desc:"S3 endpoint for the HLS cache." introductionVersion:"%%NEXT%%"`
+	CacheS3AccessKey string `yaml:"cache_s3_access_key" env:"WEBDAV_HLS_CACHE_S3_ACCESS_KEY" desc:"S3 access key for HLS cache authentication." introductionVersion:"%%NEXT%%"`
+	CacheS3SecretKey string `yaml:"cache_s3_secret_key" env:"WEBDAV_HLS_CACHE_S3_SECRET_KEY" desc:"S3 secret key for HLS cache authentication." introductionVersion:"%%NEXT%%"`
 }

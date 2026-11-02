@@ -310,6 +310,17 @@ func queryRouteMatcher(endpoint string, target url.URL) bool {
 	}
 	tq := target.Query()
 	for k := range q {
+		// A route configured with no value for a parameter matches on the
+		// parameter being present at all, whatever its value. This is what lets
+		// one route cover a family of generated URLs — "/dav/?hls=" catches
+		// master.m3u8, every media playlist and every one of a few thousand
+		// segment names, which cannot be enumerated as exact values.
+		if q.Get(k) == "" {
+			if !tq.Has(k) {
+				return false
+			}
+			continue
+		}
 		if q.Get(k) != tq.Get(k) {
 			return false
 		}

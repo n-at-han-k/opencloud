@@ -53,6 +53,18 @@ func DefaultConfig() *config.Config {
 				"512", "640", "768", "1024", "1280", "1920", "2048",
 			},
 		},
+		HLS: config.HLS{
+			SegmentDuration:  "4s",
+			MaxInputFileSize: "20GB",
+			// Generous, because the first request for a source that can be
+			// copied indexes its keyframes, which reads the whole file once.
+			Timeout:      "30m",
+			CacheBackend: "file",
+			// One concurrent run by default: this process also has to answer
+			// PROPFIND, and an operator raising this knows what the box has.
+			Concurrency:   1,
+			ThreadsPerJob: 2,
+		},
 	}
 }
 

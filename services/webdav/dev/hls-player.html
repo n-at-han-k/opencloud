@@ -1,0 +1,388 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>OpenCloud HLS player</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!--
+  A standalone page for exercising OpenCloud's HLS endpoints in a real browser.
+
+  It exists because the thing that matters about a video stream is whether a
+  browser's media stack will play it, and nothing short of a browser can answer
+  that. Playlists that parse, segments with the right boxes and correct decode
+  times are all necessary and none of them are sufficient: the player is the
+  only judge of whether the pieces actually fit together.
+
+  Point it at the DAV URL of a video and it appends ?hls=master.m3u8. On Chrome
+  and Firefox it drives hls.js; Safari plays HLS natively and gets the URL
+  directly.
+
+  The self-test is the useful part. It plays from the start, confirms playback
+  crosses the first segment boundary, then seeks near the end and confirms
+  playback continues there. Crossing a boundary is what catches segments that
+  are individually well-formed but all claim to start at t=0 -- those play the
+  first segment and then stall or loop. Seeking near the end is what catches a
+  pipeline that only ever generates segment zero.
+
+  Results are mirrored to window.hlsProbe so a browser automation tool can read
+  them without scraping the DOM.
+-->
+<style>
+  :root {
+    --bg: #ffffff;
+    --fg: #1a1c1f;
+    --muted: #5c636b;
+    --line: #e3e6ea;
+    --panel: #f6f7f9;
+    --accent: #2b6cb0;
+    --ok: #1f7a4d;
+    --bad: #b02a2a;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #15171a; --fg: #e8eaed; --muted: #9aa2ab; --line: #2b2f35;
+      --panel: #1c1f23; --accent: #7aa7d8; --ok: #5bbd8a; --bad: #e08585;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #15171a; --fg: #e8eaed; --muted: #9aa2ab; --line: #2b2f35;
+    --panel: #1c1f23; --accent: #7aa7d8; --ok: #5bbd8a; --bad: #e08585;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 15px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  }
+  main { max-width: 900px; margin: 0 auto; padding: 24px 16px 64px; }
+  h1 { font-size: 1.3rem; margin: 0 0 4px; }
+  p.sub { color: var(--muted); margin: 0 0 24px; }
+  label { display: block; font-size: .85rem; color: var(--muted); margin-bottom: 4px; }
+  input[type=text] {
+    width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px;
+    background: var(--bg); color: var(--fg); font-family: var(--mono); font-size: .85rem;
+  }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; margin: 16px 0; }
+  button {
+    padding: 8px 14px; border: 1px solid var(--line); border-radius: 6px;
+    background: var(--panel); color: var(--fg); font-size: .9rem; cursor: pointer;
+  }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button:disabled { opacity: .5; cursor: default; }
+  video { width: 100%; background: #000; border-radius: 8px; margin-top: 8px; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; margin-top: 16px; }
+  .panel h2 { font-size: .8rem; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 8px; }
+  dl { display: grid; grid-template-columns: max-content 1fr; gap: 4px 16px; margin: 0; font-family: var(--mono); font-size: .82rem; }
+  dt { color: var(--muted); }
+  dd { margin: 0; overflow-wrap: anywhere; }
+  #log { font-family: var(--mono); font-size: .78rem; max-height: 260px; overflow: auto; white-space: pre-wrap; margin: 0; }
+  .verdict { font-weight: 600; }
+  .verdict.ok { color: var(--ok); }
+  .verdict.bad { color: var(--bad); }
+  ul.checks { list-style: none; padding: 0; margin: 0; font-family: var(--mono); font-size: .82rem; }
+  ul.checks li { padding: 2px 0; }
+  ul.checks li::before { content: "… "; color: var(--muted); }
+  ul.checks li.pass::before { content: "PASS "; color: var(--ok); }
+  ul.checks li.fail::before { content: "FAIL "; color: var(--bad); }
+</style>
+</head>
+<body>
+<main>
+  <h1>OpenCloud HLS player</h1>
+  <p class="sub">Plays a stored video through the <code>?hls=</code> endpoints, and checks that a browser really plays it.</p>
+
+  <label for="src">DAV URL of the video (without the query)</label>
+  <input id="src" type="text" spellcheck="false"
+         value="/remote.php/dav/files/admin/video.mp4">
+
+  <div class="row">
+    <button id="load" class="primary">Load</button>
+    <button id="selftest">Run self-test</button>
+    <button id="stop">Stop</button>
+  </div>
+
+  <!--
+    Muted by default, because browsers refuse to autoplay a video with audio
+    without a user gesture and the self-test has no gesture to offer. The test
+    asks whether the media stack decodes and advances through the segments,
+    which muting does not affect. Unmute with the player's own control.
+  -->
+  <video id="video" controls playsinline preload="auto" muted></video>
+
+  <div class="panel">
+    <h2>Self-test</h2>
+    <p id="verdict" class="verdict">not run</p>
+    <ul id="checks" class="checks"></ul>
+  </div>
+
+  <div class="panel">
+    <h2>State</h2>
+    <dl>
+      <dt>engine</dt><dd id="s-engine">&mdash;</dd>
+      <dt>codecs</dt><dd id="s-codecs">&mdash;</dd>
+      <dt>duration</dt><dd id="s-duration">&mdash;</dd>
+      <dt>currentTime</dt><dd id="s-time">&mdash;</dd>
+      <dt>furthest reached</dt><dd id="s-max">&mdash;</dd>
+      <dt>buffered</dt><dd id="s-buffered">&mdash;</dd>
+      <dt>segments loaded</dt><dd id="s-segments">&mdash;</dd>
+      <dt>errors</dt><dd id="s-errors">0</dd>
+    </dl>
+  </div>
+
+  <div class="panel">
+    <h2>Log</h2>
+    <pre id="log"></pre>
+  </div>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js"></script>
+<script>
+(() => {
+  "use strict";
+
+  const el = (id) => document.getElementById(id);
+  const video = el("video");
+
+  // Everything a browser automation tool needs, without scraping the DOM.
+  const probe = window.hlsProbe = {
+    engine: null,
+    url: null,
+    codecs: null,
+    duration: null,
+    currentTime: 0,
+    maxCurrentTime: 0,
+    segmentsLoaded: 0,
+    segmentUris: [],
+    errors: [],
+    selfTest: { running: false, done: false, passed: null, checks: [] },
+  };
+
+  let hls = null;
+
+  function log(message) {
+    const line = `${new Date().toISOString().substr(11, 12)}  ${message}\n`;
+    el("log").textContent += line;
+    el("log").scrollTop = el("log").scrollHeight;
+  }
+
+  function fmt(seconds) {
+    return Number.isFinite(seconds) ? seconds.toFixed(3) + "s" : "—";
+  }
+
+  function refresh() {
+    probe.currentTime = video.currentTime;
+    probe.maxCurrentTime = Math.max(probe.maxCurrentTime, video.currentTime);
+    probe.duration = Number.isFinite(video.duration) ? video.duration : null;
+
+    const ranges = [];
+    for (let i = 0; i < video.buffered.length; i++) {
+      ranges.push(`${video.buffered.start(i).toFixed(2)}-${video.buffered.end(i).toFixed(2)}`);
+    }
+
+    el("s-engine").textContent = probe.engine || "—";
+    el("s-codecs").textContent = probe.codecs || "—";
+    el("s-duration").textContent = fmt(video.duration);
+    el("s-time").textContent = fmt(video.currentTime);
+    el("s-max").textContent = fmt(probe.maxCurrentTime);
+    el("s-buffered").textContent = ranges.join(", ") || "—";
+    el("s-segments").textContent = String(probe.segmentsLoaded);
+    el("s-errors").textContent = String(probe.errors.length);
+  }
+
+  function masterUrl() {
+    const base = el("src").value.trim();
+    // A query-only reference, exactly as the playlists use: it keeps the file's
+    // own path and replaces only the query.
+    return base + (base.includes("?") ? "&" : "?") + "hls=master.m3u8";
+  }
+
+  function teardown() {
+    if (hls) { hls.destroy(); hls = null; }
+    video.removeAttribute("src");
+    video.load();
+  }
+
+  function load() {
+    teardown();
+    probe.segmentsLoaded = 0;
+    probe.segmentUris = [];
+    probe.errors = [];
+    probe.maxCurrentTime = 0;
+    probe.codecs = null;
+    probe.url = masterUrl();
+
+    log(`loading ${probe.url}`);
+
+    if (window.Hls && window.Hls.isSupported()) {
+      probe.engine = "hls.js " + window.Hls.version;
+      hls = new window.Hls({ enableWorker: true, lowLatencyMode: false });
+
+      hls.on(window.Hls.Events.MANIFEST_PARSED, (_e, data) => {
+        const codecs = (data.levels || []).map((l) => l.attrs && l.attrs.CODECS).filter(Boolean);
+        probe.codecs = codecs.join(" | ") || null;
+        log(`manifest parsed: ${data.levels.length} level(s), codecs ${probe.codecs}`);
+        refresh();
+      });
+      hls.on(window.Hls.Events.FRAG_LOADED, (_e, data) => {
+        probe.segmentsLoaded++;
+        const uri = (data.frag && data.frag.relurl) || "";
+        probe.segmentUris.push(uri);
+        log(`fragment loaded sn=${data.frag.sn} start=${data.frag.start.toFixed(3)} ${uri}`);
+        refresh();
+      });
+      hls.on(window.Hls.Events.ERROR, (_e, data) => {
+        const message = `${data.type}/${data.details}${data.fatal ? " (fatal)" : ""}`;
+        probe.errors.push(message);
+        log(`ERROR ${message}`);
+        refresh();
+      });
+
+      hls.loadSource(probe.url);
+      hls.attachMedia(video);
+    } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
+      // Safari plays HLS natively, which is also the only way to test the
+      // native path at all.
+      probe.engine = "native";
+      video.src = probe.url;
+      log("using the browser's native HLS support");
+    } else {
+      probe.engine = "none";
+      probe.errors.push("no HLS support in this browser");
+      log("ERROR this browser cannot play HLS and hls.js is unavailable");
+    }
+    refresh();
+  }
+
+  // --- self-test ------------------------------------------------------------
+
+  function check(name, passed, detail) {
+    probe.selfTest.checks.push({ name, passed, detail: detail || null });
+    const li = document.createElement("li");
+    li.className = passed ? "pass" : "fail";
+    li.textContent = name + (detail ? ` — ${detail}` : "");
+    el("checks").appendChild(li);
+    log(`${passed ? "PASS" : "FAIL"} ${name}${detail ? " — " + detail : ""}`);
+  }
+
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  // Wait for playback to actually progress past target.
+  //
+  // It samples twice rather than once because assigning currentTime moves the
+  // clock by itself: after a seek the position is already where we asked for,
+  // which says nothing about whether the stream plays from there. Two rising
+  // samples while the element is not paused is playback.
+  async function advanceFrom(from, target, timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    let previous = video.currentTime;
+    let rising = 0;
+
+    while (Date.now() < deadline) {
+      refresh();
+      if (probe.errors.some((e) => e.includes("fatal"))) return false;
+
+      if (!video.paused && video.currentTime > previous + 0.01) {
+        rising++;
+      }
+      previous = video.currentTime;
+
+      if (video.currentTime >= target && rising >= 2) return true;
+      await wait(250);
+    }
+
+    return false;
+  }
+
+  async function selfTest() {
+    el("checks").innerHTML = "";
+    probe.selfTest = { running: true, done: false, passed: null, checks: [] };
+    el("verdict").textContent = "running…";
+    el("verdict").className = "verdict";
+
+    // A muted video is allowed to start without a user gesture; an unmuted one
+    // is not, and play() would reject before a single frame was decoded.
+    video.muted = true;
+
+    load();
+
+    // Wait for metadata, which is where a broken playlist or an unreadable
+    // init segment shows up first.
+    const gotMeta = await (async () => {
+      const deadline = Date.now() + 20000;
+      while (Date.now() < deadline) {
+        if (Number.isFinite(video.duration) && video.duration > 0) return true;
+        if (probe.errors.some((e) => e.includes("fatal"))) return false;
+        await wait(250);
+      }
+      return false;
+    })();
+
+    check("metadata loads and reports a duration", gotMeta,
+      gotMeta ? `duration ${fmt(video.duration)}` : "no duration within 20s");
+
+    if (!gotMeta) return finish();
+
+    const duration = video.duration;
+
+    try { await video.play(); } catch (err) { log("play() rejected: " + err); }
+
+    // Playback has to cross the first segment boundary. Segments that each
+    // claim to start at zero play the first one and then stop here.
+    const boundary = Math.min(5.0, duration * 0.45);
+    const crossed = await advanceFrom(0, boundary, 30000);
+    check("playback crosses the first segment boundary", crossed,
+      `reached ${fmt(probe.maxCurrentTime)} of a ${fmt(duration)} stream`);
+
+    // Seek near the end: this only works if segments other than the first are
+    // generated, and if they sit where the playlist says they do.
+    const seekTo = Math.max(0, duration - 2.0);
+    log(`seeking to ${fmt(seekTo)}`);
+    video.currentTime = seekTo;
+    try { await video.play(); } catch (err) { log("play() after seek rejected: " + err); }
+
+    const playedLate = await advanceFrom(seekTo, Math.min(duration - 0.2, seekTo + 0.6), 30000);
+    check("playback continues after seeking near the end", playedLate,
+      `currentTime ${fmt(video.currentTime)} after seeking to ${fmt(seekTo)}`);
+
+    check("no fatal player errors", !probe.errors.some((e) => e.includes("fatal")),
+      probe.errors.length ? probe.errors.join("; ") : "none");
+
+    check("more than one segment was fetched", probe.segmentsLoaded > 1,
+      `${probe.segmentsLoaded} fragment loads`);
+
+    finish();
+  }
+
+  function finish() {
+    const passed = probe.selfTest.checks.every((c) => c.passed);
+    probe.selfTest.running = false;
+    probe.selfTest.done = true;
+    probe.selfTest.passed = passed;
+    el("verdict").textContent = passed ? "PASSED" : "FAILED";
+    el("verdict").className = "verdict " + (passed ? "ok" : "bad");
+    log(`self-test ${passed ? "PASSED" : "FAILED"}`);
+    refresh();
+    return passed;
+  }
+
+  el("load").addEventListener("click", load);
+  el("stop").addEventListener("click", () => { video.pause(); teardown(); log("stopped"); });
+  el("selftest").addEventListener("click", selfTest);
+
+  ["loadedmetadata", "playing", "waiting", "stalled", "seeked", "ended", "error"].forEach((event) => {
+    video.addEventListener(event, () => { log(`video: ${event}`); refresh(); });
+  });
+  setInterval(refresh, 500);
+
+  // Let automation start the test without a click.
+  window.hlsSelfTest = selfTest;
+
+  if (new URLSearchParams(location.search).get("autotest") === "1") {
+    const src = new URLSearchParams(location.search).get("src");
+    if (src) el("src").value = src;
+    selfTest();
+  }
+})();
+</script>
+</body>
+</html>

@@ -31,6 +31,9 @@ import (
 	"github.com/opencloud-eu/opencloud/services/webdav/pkg/constants"
 	"github.com/opencloud-eu/opencloud/services/webdav/pkg/dav/requests"
 	"github.com/opencloud-eu/opencloud/services/webdav/pkg/generator"
+	"github.com/opencloud-eu/opencloud/services/webdav/pkg/hls"
+	hlscache "github.com/opencloud-eu/opencloud/services/webdav/pkg/hls/cache"
+	hlsworkflow "github.com/opencloud-eu/opencloud/services/webdav/pkg/hls/workflow"
 	"github.com/opencloud-eu/opencloud/services/webdav/pkg/thumbnail"
 	"github.com/opencloud-eu/opencloud/services/webdav/pkg/thumbnail/cache"
 	"github.com/opencloud-eu/opencloud/services/webdav/pkg/thumbnail/workflow"
@@ -97,6 +100,17 @@ func NewService(opts ...Option) (Service, error) {
 		}
 	}
 
+	// HLS has its own switch. Turning previews off must not take video playback
+	// with it, and the two pipelines fail independently: a broken generator URL
+	// should not stop playback, a missing ffmpeg should not stop previews.
+	var hwf *hlsworkflow.Workflow
+	if !conf.HLS.Disable {
+		hwf, err = newHLSWorkflow(conf, options.Logger, gatewaySelector)
+		if err != nil {
+			return nil, fmt.Errorf("create hls workflow: %w", err)
+		}
+	}
+
 	svc := Webdav{
 		config:          conf,
 		sourceTypes:     sourceTypes,
@@ -104,6 +118,7 @@ func NewService(opts ...Option) (Service, error) {
 		mux:             m,
 		searchClient:    searchsvc.NewSearchProviderService("eu.opencloud.api.search", conf.GrpcClient),
 		workflow:        wf,
+		hlsWorkflow:     hwf,
 		gatewaySelector: gatewaySelector,
 	}
 
@@ -228,6 +243,74 @@ func newThumbnailWorkflow(conf *config.Config, sourceTypes thumbnail.SourceTypes
 	)
 }
 
+// newHLSWorkflow wires the HLS pipeline: the ffmpeg executor, its own cache, the
+// loopback source server and the gateway-backed lookups.
+//
+// It is deliberately a separate constructor with a separate cache and separate
+// limits. HLS and previews share a shape, not a workload: a film's segments are
+// gigabytes against a thumbnail's kilobytes, and ffmpeg's appetite for CPU has
+// nothing to do with the generator's.
+func newHLSWorkflow(conf *config.Config, logger log.Logger, gatewaySelector pool.Selectable[gatewayv1beta1.GatewayAPIClient]) (*hlsworkflow.Workflow, error) {
+	maxInputSize, err := generator.ParseMaxInputFileSize(conf.HLS.MaxInputFileSize)
+	if err != nil {
+		return nil, fmt.Errorf("parse HLS max input file size: %w", err)
+	}
+
+	timeout, err := time.ParseDuration(conf.HLS.Timeout)
+	if err != nil {
+		return nil, fmt.Errorf("parse HLS timeout: %w", err)
+	}
+	if timeout == 0 {
+		timeout = 10 * time.Minute
+	}
+
+	targetDuration, err := time.ParseDuration(conf.HLS.SegmentDuration)
+	if err != nil {
+		return nil, fmt.Errorf("parse HLS segment duration: %w", err)
+	}
+
+	s3cfg := hlscache.BuildS3CacheConfig(
+		conf.HLS.CacheS3Bucket,
+		conf.HLS.CacheS3Region,
+		conf.HLS.CacheS3Endpoint,
+		conf.HLS.CacheS3AccessKey,
+		conf.HLS.CacheS3SecretKey,
+	)
+
+	c, err := hlscache.New(conf.HLS.CacheBackend, conf.HLS.CacheDir, s3cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	// The source server reads ranges, so its client must not carry the segment
+	// timeout as a whole-body deadline: ffmpeg holds a response open while it
+	// reads, and a range of a large file legitimately takes a while.
+	httpClient := &http.Client{}
+
+	return hlsworkflow.NewWorkflow(
+		hlsworkflow.WithCache(c),
+		hlsworkflow.WithMaxInputSize(maxInputSize),
+		hlsworkflow.WithSourceTypes(hls.NewSourceTypes(conf.HLS.AdditionalSourceTypes)),
+		hlsworkflow.WithTargetDuration(targetDuration),
+		hlsworkflow.WithTimeout(timeout),
+		hlsworkflow.WithWebdavNamespace(conf.WebdavNamespace),
+		hlsworkflow.WithLogger(logger),
+		hlsworkflow.WithStater(hlsworkflow.NewGatewayStater(gatewaySelector)),
+		hlsworkflow.WithSpaceLookup(hlsworkflow.NewGatewaySpaceLookup(gatewaySelector)),
+		hlsworkflow.WithUserResolver(hlsworkflow.NewGatewayUserResolver(gatewaySelector)),
+		hlsworkflow.WithExecutor(hlsworkflow.NewFfmpegExecutor(
+			conf.HLS.FfmpegBinary,
+			conf.HLS.FfprobeBinary,
+			conf.HLS.Concurrency,
+			conf.HLS.ThreadsPerJob,
+		)),
+		hlsworkflow.WithSourceServer(hlsworkflow.NewSourceServer(
+			hlsworkflow.NewGatewayRangeDownloader(gatewaySelector, httpClient),
+			logger,
+		)),
+	)
+}
+
 // Webdav implements the business logic for Service.
 type Webdav struct {
 	sourceTypes     thumbnail.SourceTypes
@@ -236,6 +319,7 @@ type Webdav struct {
 	mux             *chi.Mux
 	searchClient    searchsvc.SearchProviderService
 	workflow        *workflow.ThumbnailWorkflow
+	hlsWorkflow     *hlsworkflow.Workflow
 	gatewaySelector pool.Selectable[gatewayv1beta1.GatewayAPIClient]
 }
 
@@ -346,10 +430,96 @@ func (g Webdav) writeThumbnail(w http.ResponseWriter, r *http.Request, tr *reque
 	generator.WriteThumbnailResponse(w, thumb.Data, thumb.ContentType)
 }
 
+// writeHLS runs the HLS workflow and answers with the requested artifact.
+func (g Webdav) writeHLS(w http.ResponseWriter, r *http.Request, hlsReq *requests.HLSRequest, auth string, logger log.Logger) {
+	artifact, err := g.hlsWorkflow.Execute(r.Context(), hlsReq, auth, logger)
+	if err != nil {
+		g.handleHLSError(w, r, err, hlsReq.Filename, logger, "hls")
+		return
+	}
+
+	writeHLSResponse(w, artifact.Data, artifact.ContentType)
+}
+
+// writeHLSResponse writes an HLS artifact to the response.
+//
+// Playlists carry no caching headers of their own: the artifacts are keyed on the
+// source's checksum, so a changed file is a different URL's worth of content and
+// a stale playlist would describe segments that no longer exist.
+func writeHLSResponse(w http.ResponseWriter, data []byte, contentType string) {
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(data)
+}
+
+// handleHLSError maps an HLS workflow error onto the response. It mirrors
+// handleWorkflowError, including the 425 for a file still being processed and
+// the 429 with Retry-After when the transcoder is at capacity, because those two
+// are the whole reason a player retries rather than giving up.
+func (g Webdav) handleHLSError(w http.ResponseWriter, r *http.Request, err error, filename string, logger log.Logger, step string) {
+	var busy *hlsworkflow.GeneratorBusyError
+
+	logger = log.Logger{Logger: logger.With().Str("step", step).Logger()}
+
+	switch {
+	case errors.Is(err, hlsworkflow.ErrFileProcessing):
+		addRetryAfterHeader(w)
+		renderError(w, r, errTooEarly("file is being processed"))
+	case errors.As(err, &busy):
+		logger.Debug().Err(err).Msg("hls transcoder is busy")
+		w.Header().Set("Retry-After", strconv.Itoa(max(busy.RetryAfterSeconds, 1)))
+		renderError(w, r, errTooManyRequests("the hls transcoder is busy"))
+	case errors.Is(err, hlsworkflow.ErrSourceTooLarge):
+		logger.Debug().Err(err).Msg("hls source too large")
+		renderError(w, r, errPermissionDenied(hlsworkflow.ErrSourceTooLarge.Error()))
+	case errors.Is(err, hlsworkflow.ErrPermissionDenied):
+		logger.Debug().Err(err).Msg("user lacks download permission for hls")
+		renderError(w, r, errPermissionDenied(hlsworkflow.ErrPermissionDenied.Error()))
+	case errors.Is(err, hlsworkflow.ErrNotAFile):
+		logger.Debug().Err(err).Msg("requested for a non-file resource")
+		renderError(w, r, errBadRequest("Unsupported file type"))
+	case errors.Is(err, hlsworkflow.ErrUnknownArtifact):
+		// The selector is not one of the four artifacts, or names a segment the
+		// playlist never offered. Either way the client made it up.
+		logger.Debug().Err(err).Msg("unknown hls artifact")
+		renderError(w, r, errBadRequest("Unknown HLS artifact"))
+	case errors.Is(err, hlsworkflow.ErrNotFound):
+		logger.Debug().Err(err).Msg("hls source could not be located")
+		renderError(w, r, errNotFound(notFoundMsg(filename)))
+	case errors.Is(err, hlsworkflow.ErrUnsupportedFileType), errors.Is(err, hlsworkflow.ErrNoVideoStream):
+		logger.Debug().Err(err).Msg("hls requested for an unplayable file")
+		renderError(w, r, errNotFound(notFoundMsg(filename)))
+	default:
+		// ffmpeg missing, a download failure, a timeout: a server error, which
+		// a player may retry, rather than a 404 it would cache as unplayable.
+		logger.Error().Err(err).Msg("failed")
+		renderError(w, r, errInternalError("could not generate HLS artifact"))
+	}
+}
+
 // Thumbnail serves a thumbnail for every authenticated DAV path, spaces, files
 // and the legacy /webdav root alike: the reference is parsed from the request.
 func (g Webdav) Thumbnail(w http.ResponseWriter, r *http.Request) {
 	logger := g.requestLogger(r)
+	if r.URL.Query().Has("hls") {
+		if g.hlsWorkflow == nil {
+			http.NotFound(w, r)
+			return
+		}
+
+		hlsReq, err := requests.ParseHLSRequest(r)
+		if err != nil {
+			logger.Debug().Err(err).Msg("could not create HLS Request")
+			renderError(w, r, errBadRequest(err.Error()))
+			return
+		}
+
+		g.writeHLS(w, r, hlsReq, r.Header.Get(revactx.TokenHeader), logger)
+		return
+	}
+
 	tr, ok := g.parseThumbnailRequest(w, r, logger)
 	if !ok {
 		return
@@ -361,6 +531,29 @@ func (g Webdav) Thumbnail(w http.ResponseWriter, r *http.Request) {
 // PublicThumbnail serves a thumbnail for a file behind a public link.
 func (g Webdav) PublicThumbnail(w http.ResponseWriter, r *http.Request) {
 	logger := g.requestLogger(r)
+	if r.URL.Query().Has("hls") {
+		if g.hlsWorkflow == nil {
+			http.NotFound(w, r)
+			return
+		}
+
+		hlsReq, err := requests.ParseHLSRequest(r)
+		if err != nil {
+			logger.Debug().Err(err).Msg("could not create HLS Request")
+			renderError(w, r, errBadRequest(err.Error()))
+			return
+		}
+
+		auth, err := workflow.ResolvePublicLinkAuth(r.Context(), r, chi.URLParam(r, "token"), g.gatewaySelector)
+		if err != nil {
+			g.handlePublicLinkAuthError(w, r, err, hlsReq.Filename, logger)
+			return
+		}
+
+		g.writeHLS(w, r, hlsReq, auth, logger)
+		return
+	}
+
 	tr, ok := g.parseThumbnailRequest(w, r, logger)
 	if !ok {
 		return
@@ -390,6 +583,34 @@ func whoami(gatewayClient gatewayv1beta1.GatewayAPIClient, ctx context.Context, 
 
 func (g Webdav) PublicThumbnailHead(w http.ResponseWriter, r *http.Request) {
 	logger := g.requestLogger(r)
+	if r.URL.Query().Has("hls") {
+		if g.hlsWorkflow == nil {
+			http.NotFound(w, r)
+			return
+		}
+
+		hlsReq, err := requests.ParseHLSRequest(r)
+		if err != nil {
+			logger.Debug().Err(err).Msg("could not create HLS Request")
+			renderError(w, r, errBadRequest(err.Error()))
+			return
+		}
+
+		auth, err := workflow.ResolvePublicLinkAuth(r.Context(), r, chi.URLParam(r, "token"), g.gatewaySelector)
+		if err != nil {
+			g.handlePublicLinkAuthError(w, r, err, hlsReq.Filename, logger)
+			return
+		}
+
+		if err := g.hlsWorkflow.Head(r.Context(), hlsReq, auth, logger); err != nil {
+			g.handleHLSError(w, r, err, hlsReq.Filename, logger, "hls head check")
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
 	tr, ok := g.parseThumbnailRequest(w, r, logger)
 	if !ok {
 		return

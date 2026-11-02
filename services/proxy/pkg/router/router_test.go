@@ -56,6 +56,16 @@ func TestQueryRouteMatcher(t *testing.T) {
 			matches:  true,
 		},
 		{endpoint: "/fobar", target: "/foobar", matches: false},
+
+		// A route with no value matches on the parameter being present, which is
+		// how one route covers every generated HLS artifact name.
+		{endpoint: "/dav/?hls=", target: "/dav/spaces/1$2/a.mkv?hls=master.m3u8", matches: true},
+		{endpoint: "/dav/?hls=", target: "/dav/spaces/1$2/a.mkv?hls=v0/seg01234.m4s", matches: true},
+		{endpoint: "/dav/?hls=", target: "/dav/spaces/1$2/a.mkv?hls=", matches: true},
+		{endpoint: "/dav/?hls=", target: "/dav/spaces/1$2/a.mkv?preview=1", matches: false},
+		{endpoint: "/dav/?hls=", target: "/dav/spaces/1$2/a.mkv", matches: false},
+		// An exact value still has to match exactly.
+		{endpoint: "/dav/?preview=1", target: "/dav/spaces/1$2/a.mkv?preview=2", matches: false},
 	}
 
 	for _, test := range table {

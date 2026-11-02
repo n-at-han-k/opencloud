@@ -30,7 +30,7 @@ RUN make go-generate build ENABLE_VIPS=true
 
 FROM alpine:3.24
 
-RUN apk add --no-cache attr ca-certificates curl mailcap tree vips && \
+RUN apk add --no-cache attr ca-certificates curl ffmpeg mailcap tree vips && \
 	echo 'hosts: files dns' >| /etc/nsswitch.conf
 
 LABEL maintainer="OpenCloud GmbH <devops@opencloud.eu>" \
